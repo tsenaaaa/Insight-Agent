@@ -1,0 +1,8 @@
+venv/
+venvvenv/
+.env
+__pycache__/
+.vscode/
+chat_history.json
+frontend-insight/.next/
+.next/
