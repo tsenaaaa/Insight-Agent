@@ -1,7 +1,6 @@
 import os
-import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -10,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain_community.utilities import SQLDatabase
 from langchain_groq import ChatGroq
 from langchain_community.agent_toolkits import SQLDatabaseToolkit, create_sql_agent
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text, create_engine
 
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -32,22 +31,95 @@ DATASET_TABLES = {
     "dataset_3": ["shopee_sales"]
 }
 
-HISTORY_FILE = "chat_history.json"
+engine = create_engine(DATABASE_URL)
 
 
-def load_history():
-    if not os.path.exists(HISTORY_FILE):
-        return {}
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
+def init_db():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_chat_history_dataset_conv
+            ON chat_history(dataset_id, conversation_id)
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_chat_history_conv
+            ON chat_history(conversation_id)
+        """))
 
 
-def save_history(data):
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+init_db()
+
+
+def save_message(dataset_id: str, conversation_id: str, role: str, content: str):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO chat_history (id, dataset_id, conversation_id, role, content, created_at)
+                VALUES (:id, :dataset_id, :conversation_id, :role, :content, :created_at)
+            """),
+            {
+                "id": str(uuid.uuid4()),
+                "dataset_id": dataset_id,
+                "conversation_id": conversation_id,
+                "role": role,
+                "content": content,
+                "created_at": datetime.now(timezone.utc),
+            },
+        )
+
+
+def get_conversations(dataset_id: str):
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("""
+                SELECT conversation_id,
+                       MIN(created_at) as created_at,
+                       COUNT(*) as message_count,
+                       MIN(CASE WHEN role = 'user' THEN content END) as first_user_content
+                FROM chat_history
+                WHERE dataset_id = :dataset_id
+                GROUP BY conversation_id
+                ORDER BY created_at DESC
+            """),
+            {"dataset_id": dataset_id},
+        )
+        rows = result.fetchall()
+    return [
+        {
+            "id": r[0],
+            "title": (r[3] or "Tanpa judul")[:60],
+            "created_at": r[1].isoformat() if r[1] else "",
+            "message_count": r[2],
+        }
+        for r in rows
+    ]
+
+
+def get_messages(dataset_id: str, conversation_id: str):
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("""
+                SELECT role, content, created_at
+                FROM chat_history
+                WHERE dataset_id = :dataset_id AND conversation_id = :conversation_id
+                ORDER BY created_at ASC
+            """),
+            {"dataset_id": dataset_id, "conversation_id": conversation_id},
+        )
+        rows = result.fetchall()
+    return [
+        {"role": r[0], "content": r[1], "ts": r[2].isoformat() if r[2] else None}
+        for r in rows
+    ]
 
 
 class QueryRequest(BaseModel):
@@ -131,23 +203,9 @@ async def ask_agent(request: QueryRequest):
         answer = response["output"]
 
         conversation_id = request.conversation_id or str(uuid.uuid4())
-        now = datetime.now().isoformat()
 
-        history = load_history()
-        dataset_hist = history.setdefault(request.dataset_id, {})
-
-        if conversation_id not in dataset_hist:
-            dataset_hist[conversation_id] = {
-                "title": request.question[:60],
-                "created_at": now,
-                "messages": []
-            }
-
-        conv = dataset_hist[conversation_id]
-        conv["messages"].append({"role": "user", "content": request.question, "ts": now})
-        conv["messages"].append({"role": "assistant", "content": answer, "ts": now})
-
-        save_history(history)
+        save_message(request.dataset_id, conversation_id, "user", request.question)
+        save_message(request.dataset_id, conversation_id, "assistant", answer)
 
         return QueryResponse(status="success", data=answer, conversation_id=conversation_id)
 
@@ -157,28 +215,15 @@ async def ask_agent(request: QueryRequest):
 
 @app.get("/conversations/{dataset_id}")
 async def list_conversations(dataset_id: str):
-    history = load_history()
-    dataset_hist = history.get(dataset_id, {})
-    result = []
-    for cid, conv in dataset_hist.items():
-        result.append({
-            "id": cid,
-            "title": conv.get("title", "Tanpa judul"),
-            "created_at": conv.get("created_at", ""),
-            "message_count": len(conv.get("messages", []))
-        })
-    result.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return result
+    return get_conversations(dataset_id)
 
 
 @app.get("/conversations/{dataset_id}/{conversation_id}")
 async def get_conversation(dataset_id: str, conversation_id: str):
-    history = load_history()
-    dataset_hist = history.get(dataset_id, {})
-    conv = dataset_hist.get(conversation_id)
-    if not conv:
+    messages = get_messages(dataset_id, conversation_id)
+    if not messages:
         raise HTTPException(status_code=404, detail="Conversation tidak ditemukan.")
-    return conv
+    return {"messages": messages}
 
 
 class PreviewRequest(BaseModel):
