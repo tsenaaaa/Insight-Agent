@@ -14,7 +14,7 @@ from sqlalchemy import inspect, text
 
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 app = FastAPI(title="Insight-Agent API")
 
@@ -81,7 +81,7 @@ async def get_schema(dataset_id: str):
 
     try:
         db = SQLDatabase.from_uri(
-            SUPABASE_URL,
+            DATABASE_URL,
             include_tables=target_tables
         )
 
@@ -109,7 +109,7 @@ async def ask_agent(request: QueryRequest):
 
     try:
         db = SQLDatabase.from_uri(
-            SUPABASE_URL,
+            DATABASE_URL,
             include_tables=target_tables
         )
 
@@ -192,7 +192,7 @@ async def preview_data(request: PreviewRequest):
         raise HTTPException(status_code=400, detail="Dataset tidak valid.")
 
     try:
-        db = SQLDatabase.from_uri(SUPABASE_URL, include_tables=target_tables)
+        db = SQLDatabase.from_uri(DATABASE_URL, include_tables=target_tables)
 
         primary_table = target_tables[0]
 
